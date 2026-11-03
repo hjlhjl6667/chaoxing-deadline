@@ -1,5 +1,10 @@
 # 学习通作业倒计时 · 日历订阅
 
+[![CI](https://github.com/hjlhjl6667/chaoxing-deadline/actions/workflows/test.yml/badge.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/releases)
+[![Tampermonkey](https://img.shields.io/badge/Tampermonkey-✓-orange.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/raw/main/chaoxing-deadline.user.js)
+
 > 把学习通的作业截止时间，变成你手机日历里的**真实闹钟**。
 
 一个 Tampermonkey 用户脚本。点一下，扫描你所有课程的未交作业、待互评、待批阅、考试和未读通知，按剩余时间排好序；再点一下，导出成 `.ics`，丢进手机系统日历——然后就再也不用记着去打开学习通了。
