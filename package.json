@@ -1,0 +1,25 @@
+{
+  "name": "chaoxing-deadline",
+  "version": "1.0.0",
+  "description": "学习通作业倒计时 · 把作业截止时间导出到手机日历，到期自动提醒",
+  "type": "module",
+  "scripts": {
+    "test": "node test/ics.test.mjs",
+    "demo": "node tools/gen-demo.mjs"
+  },
+  "keywords": [
+    "chaoxing",
+    "学习通",
+    "超星",
+    "userscript",
+    "tampermonkey",
+    "icalendar",
+    "ics",
+    "deadline",
+    "calendar"
+  ],
+  "license": "MIT",
+  "files": [
+    "chaoxing-deadline.user.js"
+  ]
+}

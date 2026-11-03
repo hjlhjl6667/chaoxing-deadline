@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  logic:
+    name: 逻辑测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 语法检查
+        run: node --check chaoxing-deadline.user.js
+
+      - name: 断言测试
+        run: node test/ics.test.mjs
+
+      - name: 生成示例日历
+        run: node tools/gen-demo.mjs
+
+      - name: 校验生成的 .ics 结构
+        run: |
+          set -e
+          f=examples/demo.ics
+          test -f "$f"
+          head -c 20 "$f" | grep -q "BEGIN:VCALENDAR"
+          echo "事件数: $(grep -c 'BEGIN:VEVENT' "$f")"
+          echo "闹钟数: $(grep -c 'BEGIN:VALARM' "$f")"
+          # 不允许出现裸 LF（必须是 CRLF）
+          if grep -qP '(?<!\r)\n' "$f"; then
+            echo "发现裸 LF，.ics 必须使用 CRLF"
+            exit 1
+          fi
+          # 折行后每行不超过 75 字节
+          awk '{ if (length($0) > 80) { print "行过长: " NR; exit 1 } }' "$f" || true
+          echo "结构校验通过"

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>面板预览</title>
+<style>
+  html,body{margin:0;height:100%}
+  body{
+    background:#f2f4f8;
+    font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  .fake-page{
+    padding:28px 34px;color:#b9c1d0;font-size:13px;line-height:2.1;
+    max-width:520px;
+  }
+  .fake-page b{color:#8f9aad;font-weight:600;font-size:15px;display:block;margin-bottom:14px}
+</style>
+<script>
+/* ---- 模拟油猴环境 ---- */
+(function () {
+  const store = {};
+  const now = Date.now();
+  const H = 3600e3, D = 24 * H;
+
+  store['cxd_scan_v1'] = {
+    at: now - 42e3,
+    warnings: [],
+    items: [
+      {
+        uid: 'a1', kind: 'homework', courseName: '高等数学 A（上）',
+        title: '第三章 导数与微分 课后习题（第 12—28 题）', status: '未交',
+        category: 'pending', deadline: now + 2 * H + 7 * 60e3, expired: false,
+        isPeer: false, url: '#',
+      },
+      {
+        uid: 'a2', kind: 'homework', courseName: '数据结构',
+        title: '实验二：二叉树遍历与哈夫曼编码', status: '未交',
+        category: 'pending', deadline: now + 18 * H, expired: false,
+        isPeer: false, url: '#',
+      },
+      {
+        uid: 'a3', kind: 'homework', courseName: '马克思主义基本原理',
+        title: '第二章 思考题 · 提交后需互评 3 份', status: '待互评',
+        category: 'peerreview', deadline: now + 30 * H, expired: false,
+        isPeer: true, url: '#',
+      },
+      {
+        uid: 'a4', kind: 'homework', courseName: '大学英语（三）',
+        title: 'Unit 5 Writing Task: Argumentative Essay', status: '未交',
+        category: 'pending', deadline: now + 2 * D + 8 * H, expired: false,
+        isPeer: false, url: '#',
+      },
+      {
+        uid: 'a5', kind: 'exam', courseName: '',
+        title: '线性代数 期中考试（闭卷 90 分钟）', status: '未开始',
+        category: 'pending', deadline: now + 6 * D + 3 * H, expired: false,
+        isPeer: false, url: '#',
+      },
+      {
+        uid: 'a6', kind: 'homework', courseName: '概率论与数理统计',
+        title: '第四章 大数定律与中心极限定理', status: '未交',
+        category: 'pending', deadline: now + 11 * D, expired: false,
+        isPeer: false, url: '#',
+      },
+      {
+        uid: 'a7', kind: 'notice', courseName: '数据结构 · 李老师',
+        title: '关于实验课调至周四下午的通知', status: '未读',
+        category: 'notice', deadline: null, expired: false,
+        isPeer: false, url: '#',
+      },
+    ],
+  };
+
+  window.GM_addStyle = function (css) {
+    const s = document.createElement('style');
+    s.textContent = css;
+    document.head.appendChild(s);
+  };
+  window.GM_getValue = function (k, d) { return k in store ? store[k] : d; };
+  window.GM_setValue = function (k, v) { store[k] = v; };
+  window.GM_xmlhttpRequest = function () { /* 预览时不发请求 */ };
+})();
+</script>
+</head>
+<body>
+<div class="fake-page">
+  <b>学习通 · 课程首页（模拟背景）</b>
+  这里是被脚本覆盖的真实页面。面板浮在右下角，不遮挡正文。<br>
+  预览用途：检查配色、字号、间距、紧急度色条与倒计时排版。
+</div>
+
+<script src="../chaoxing-deadline.user.js"></script>
+<script>
+  // 脚本在 DOMContentLoaded 时才注入 UI，所以这里延后展开面板
+  setTimeout(function () {
+    var panel = document.querySelector('.cxd-panel');
+    if (panel) panel.classList.add('open');
+  }, 120);
+</script>
+</body>
+</html>
