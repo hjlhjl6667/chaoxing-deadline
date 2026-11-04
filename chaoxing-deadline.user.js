@@ -2,7 +2,7 @@
 // @name         学习通作业倒计时 · 日历订阅
 // @name:en      Chaoxing Deadline → Calendar
 // @namespace    https://github.com/hjlhjl6667/chaoxing-deadline
-// @version      1.0.0
+// @version      1.1.0
 // @description  一键扫描学习通全部课程的未交作业、待互评、待批阅、考试与未读通知，按剩余时间排序，并可导出 .ics 导入手机系统日历，到期自动提醒。不是又一个网页面板 —— 是让截止时间真正进入你的日程。
 // @description:en Scan all Chaoxing assignments/exams/notices in one click, sort by time left, and export to .ics so deadlines live in your phone's calendar with real alarms.
 // @author       hjlhjl6667
@@ -16,7 +16,6 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        GM_addStyle
 // @run-at       document-idle
 // @noframes
 // @license      MIT
@@ -39,6 +38,7 @@
     RETRY: 2,
     CONCURRENCY: 3,          // 同时请求的课程数，过高易触发风控
     PAGE_GAP: 500,           // 同一课程翻页间隔 ms
+    MAX_PAGES: 50,           // 单课程最多翻页数，防止异常分页死循环
     // 缓存
     COURSE_TTL: 30 * 60e3,   // 课程列表缓存 30 分钟
     SCAN_TTL: 5 * 60e3,      // 扫描结果缓存 5 分钟
@@ -63,7 +63,7 @@
     includePeerReview: true,
     includeGrading: true,
     includeExpired: false,
-    hideRetired: true,
+    hideRetired: false,     // 默认扫描全部课程（含已结课），不漏课
     preciseMode: false,      // 走作业详情页取绝对时间（请求量大）
   };
 
@@ -71,7 +71,9 @@
    * 1. 通用工具
    * ========================================================================== */
 
-  const $ = (sel, root) => (root || document).querySelector(sel);
+  /** Shadow DOM 根节点：所有查找优先在这里，彻底避开学习通全局样式 */
+  let UI_ROOT = null;
+  const $ = (sel, root) => (root || UI_ROOT || document).querySelector(sel);
   const pad2 = (n) => String(n).padStart(2, '0');
 
   function hash(str) {
@@ -389,56 +391,134 @@
    * ========================================================================== */
 
   const API = {
-    /** 课程列表 */
-    async courses() {
+    /** 课程列表：多来源合并，尽量不漏课 */
+    async courses(force) {
       const cached = GM_getValue(STORE.courses, null);
-      if (cached && Date.now() - cached.at < CFG.COURSE_TTL) return cached.list;
+      if (!force && cached && Date.now() - cached.at < CFG.COURSE_TTL) return cached.list;
 
-      const data = await fetchJson(
-        'https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1'
-      );
+      const bag = new Map();
+      const sources = [];
 
-      if (!data || !Array.isArray(data.channelList)) {
-        throw new Error('未获取到课程列表，请确认已登录学习通');
+      const add = (c, from) => {
+        if (!c || !c.courseId || !c.classId) return;
+        const key = c.courseId + ':' + c.classId;
+        const old = bag.get(key);
+        if (old) {
+          if ((!old.name || old.name === '未命名课程') && c.name) old.name = c.name;
+          if (!old.cpi && c.cpi) old.cpi = c.cpi;
+          if (!old.teacher && c.teacher) old.teacher = c.teacher;
+          if (c.isretire) old.isretire = true;
+          if (old.sources.indexOf(from) < 0) old.sources.push(from);
+          return;
+        }
+        bag.set(key, Object.assign({}, c, { sources: [from] }));
+      };
+
+      // 来源 1：backclazzdata（主接口，返回频道列表）
+      try {
+        const data = await fetchJson(
+          'https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1'
+        );
+        const chs = (data && data.channelList) || [];
+        for (const ch of chs) {
+          const c = ch && ch.content;
+          if (!c) continue;
+          // 一个频道里可能挂多门课，必须全部取出（旧版只看 [0]，会漏课）
+          const raw = c.course && c.course.data;
+          const arr = Array.isArray(raw) ? raw : raw ? [raw] : [];
+          for (const course of arr) {
+            if (!course || !course.id) continue;
+            add(
+              {
+                courseId: String(course.id),
+                classId: String(c.id || course.clazzid || ''),
+                cpi: String(c.cpi || ''),
+                name: String(course.name || '未命名课程'),
+                teacher: String(course.teacherfactor || ''),
+                isretire: c.isretire === -1 || c.isretire === 1,
+                endDate: c.endDate || '',
+              },
+              '频道'
+            );
+          }
+        }
+        sources.push('频道 ' + chs.length);
+      } catch (e) {
+        sources.push('频道失败');
       }
 
-      const seen = new Set();
-      const list = [];
-      for (const ch of data.channelList) {
-        const c = ch && ch.content;
-        if (!c || !c.course || !Array.isArray(c.course.data)) continue;
-        const course = c.course.data[0];
-        if (!course || !course.id) continue;
-        const key = course.id + ':' + c.id;
-        if (seen.has(key)) continue; // 同一课程可能出现在多个频道，去重
-        seen.add(key);
-        list.push({
-          courseId: String(course.id),
-          classId: String(c.id),
-          cpi: String(c.cpi || ''),
-          name: String(course.name || '未命名课程'),
-          teacher: String(course.teacherfactor || ''),
-          isretire: c.isretire === -1 || c.isretire === 1,
-          endDate: c.endDate || '',
+      // 来源 2：课程页 HTML，补上频道接口没返回的课
+      try {
+        const n0 = bag.size;
+        const { text } = await fetchText('https://mooc1.chaoxing.com/visit/courselistdata', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          data: 'courseType=1&courseFolderId=0&baseEducation=0&superstarClass=0',
         });
+        for (const c of this._parseCourseLinks(text)) add(c, '课程页');
+        sources.push('课程页 +' + (bag.size - n0));
+      } catch (e) {
+        sources.push('课程页失败');
       }
 
-      GM_setValue(STORE.courses, { at: Date.now(), list });
+      const list = Array.from(bag.values());
+      if (!list.length) throw new Error('未获取到课程列表，请确认已登录学习通');
+
+      GM_setValue(STORE.courses, { at: Date.now(), list, sources });
       return list;
     },
 
-    /** 取某课程的 workEnc 与 stuenc */
-    async courseTokens(course) {
-      const url =
-        'https://mooc1.chaoxing.com/visit/stucoursemiddle' +
-        `?courseid=${course.courseId}&clazzid=${course.classId}&vc=1&cpi=${course.cpi}` +
-        '&ismooc2=1&v=2';
-      const { text, finalUrl } = await fetchText(url);
+    /** 从任意学习通页面 HTML 里抽出 courseid / clazzid */
+    _parseCourseLinks(html) {
+      const out = [];
+      let doc;
+      try {
+        doc = new DOMParser().parseFromString(html, 'text/html');
+      } catch (e) {
+        return out;
+      }
+      doc.querySelectorAll('a[href*="courseid"], a[href*="courseId"]').forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        const q = new URLSearchParams(href.split('?')[1] || '');
+        const courseId = q.get('courseid') || q.get('courseId');
+        const classId = q.get('clazzid') || q.get('classId');
+        if (!courseId || !classId) return;
+        out.push({
+          courseId: String(courseId),
+          classId: String(classId),
+          cpi: String(q.get('cpi') || ''),
+          name: (a.textContent || '').replace(/\s+/g, ' ').trim() || '未命名课程',
+          teacher: '',
+          isretire: false,
+          endDate: '',
+        });
+      });
+      return out;
+    },
 
-      const enc = this._pickEnc(text, finalUrl);
-      const stuenc = this._pickStuenc(text, finalUrl);
-      if (!enc) throw new Error('未能提取 workEnc（课程页结构可能已变更）');
-      return { enc, stuenc };
+    /** 取某课程的 workEnc 与 stuenc（两个域名都试，不同版本课程挂在不同站点） */
+    async courseTokens(course) {
+      const hosts = ['https://mooc1.chaoxing.com', 'https://mooc2-ans.chaoxing.com'];
+      let lastErr = null;
+      for (const host of hosts) {
+        try {
+          const url =
+            host +
+            '/visit/stucoursemiddle' +
+            `?courseid=${course.courseId}&clazzid=${course.classId}&vc=1&cpi=${course.cpi}` +
+            '&ismooc2=1&v=2';
+          const { text, finalUrl } = await fetchText(url);
+          const enc = this._pickEnc(text, finalUrl);
+          if (!enc) {
+            lastErr = new Error('未能提取 workEnc');
+            continue;
+          }
+          return { enc, stuenc: this._pickStuenc(text, finalUrl), host };
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw lastErr || new Error('未能提取 workEnc（课程页结构可能已变更）');
     },
 
     _pickEnc(html, finalUrl) {
@@ -469,16 +549,24 @@
       return '';
     },
 
+    /** 作业列表接口路径随站点不同 */
+    _workPath(host) {
+      return /mooc2-ans/.test(host) ? '/mooc2/work/list' : '/mooc-ans/mooc2/work/list';
+    },
+
     /** 作业列表（单页 HTML） */
     async workPage(course, tokens, pageNum) {
-      const base =
-        'https://mooc1.chaoxing.com/mooc-ans/mooc2/work/list' +
+      const host = tokens.host || 'https://mooc1.chaoxing.com';
+      const url =
+        host +
+        this._workPath(host) +
         `?courseId=${course.courseId}&classId=${course.classId}&cpi=${course.cpi}` +
         `&ut=s&enc=${tokens.enc}&t=${Date.now()}` +
         (tokens.stuenc ? `&stuenc=${tokens.stuenc}` : '') +
         '&isdisplaytable=2' +
-        (pageNum ? `&pageNum=${pageNum}` : '');
-      const { text } = await fetchText(base);
+        '&pageNum=' +
+        (pageNum || 1);
+      const { text } = await fetchText(url);
       return text;
     },
 
@@ -561,7 +649,7 @@
         });
       }
 
-      // 总页数
+      // 总页数：数字页码 + pageNum 链接都要看
       let totalPages = 1;
       const pageBox = doc.querySelector('#page');
       if (pageBox) {
@@ -569,24 +657,63 @@
           const t = li.textContent.trim();
           if (/^\d+$/.test(t)) totalPages = Math.max(totalPages, parseInt(t, 10));
         });
+        pageBox.querySelectorAll('a[href]').forEach((a) => {
+          const m = /pageNum=(\d+)/.exec(a.getAttribute('href') || '');
+          if (m) totalPages = Math.max(totalPages, parseInt(m[1], 10));
+        });
       }
 
       return { items, totalPages };
     },
 
-    /** 某课程全部作业（自动翻页） */
+    /** 某课程全部作业（自动翻页 + 换站重试） */
     async allWorks(course) {
       const tokens = await this.courseTokens(course);
-      const firstHtml = await this.workPage(course, tokens, 1);
-      const first = this.parseWorkPage(firstHtml, course, tokens);
-      let items = first.items;
+      let firstHtml = await this.workPage(course, tokens, 1);
+      let first = this.parseWorkPage(firstHtml, course, tokens);
 
-      for (let p = 2; p <= first.totalPages && p <= 20; p++) {
-        await sleep(CFG.PAGE_GAP);
-        const html = await this.workPage(course, tokens, p);
-        items = items.concat(this.parseWorkPage(html, course, tokens).items);
+      if (!first.items.length) {
+        const altHost =
+          tokens.host === 'https://mooc2-ans.chaoxing.com'
+            ? 'https://mooc1.chaoxing.com'
+            : 'https://mooc2-ans.chaoxing.com';
+        try {
+          const alt = { enc: tokens.enc, stuenc: tokens.stuenc, host: altHost };
+          const html = await this.workPage(course, alt, 1);
+          const parsed = this.parseWorkPage(html, course, alt);
+          if (parsed.items.length) {
+            tokens.host = altHost;
+            firstHtml = html;
+            first = parsed;
+          }
+        } catch (e) {
+          /* 换站失败就按原结果走 */
+        }
       }
-      return items;
+
+      let items = first.items;
+      const pages = Math.min(first.totalPages || 1, CFG.MAX_PAGES);
+
+      for (let p = 2; p <= pages; p++) {
+        await sleep(CFG.PAGE_GAP);
+        try {
+          const html = await this.workPage(course, tokens, p);
+          items = items.concat(this.parseWorkPage(html, course, tokens).items);
+        } catch (e) {
+          break;
+        }
+      }
+
+      // 去重：分页边界可能重复返回同一条
+      const seen = new Set();
+      const uniq = [];
+      for (const it of items) {
+        if (seen.has(it.uid)) continue;
+        seen.add(it.uid);
+        uniq.push(it);
+      }
+
+      return { items: uniq, pages, host: tokens.host, htmlLen: firstHtml.length };
     },
 
     /** 考试列表 */
@@ -695,11 +822,12 @@
 
   async function scanAll(settings, onProgress) {
     const warnings = [];
+    const diag = [];
     let items = [];
 
     const courses = await API.courses();
     const targets = settings.hideRetired ? courses.filter((c) => !c.isretire) : courses.slice();
-    const retriedCount = courses.length - targets.length;
+    const retiredAll = courses.filter((c) => c.isretire).length;
 
     onProgress && onProgress({ stage: 'courses', done: 0, total: targets.length });
 
@@ -707,19 +835,42 @@
     const tasks = targets.map((course) => async () => {
       const r = await API.allWorks(course);
       done++;
-      onProgress && onProgress({ stage: 'works', done, total: targets.length, course: course.name });
+      onProgress && onProgress({
+        stage: 'works', done, total: targets.length, course: course.name,
+      });
       return r;
     });
 
-    const results = await pool(tasks, CFG.CONCURRENCY);
-    results.forEach((r, i) => {
-      if (r.ok) {
-        items = items.concat(r.value);
-      } else {
-        warnings.push({
-          course: targets[i].name,
-          message: r.error && r.error.message ? r.error.message : String(r.error),
+    // 单个课程失败时也要推进进度，否则进度条会卡住
+    const safeTasks = tasks.map((t, i) => async () => {
+      try {
+        return await t();
+      } catch (e) {
+        done++;
+        onProgress && onProgress({
+          stage: 'works', done, total: targets.length, course: targets[i].name,
         });
+        throw e;
+      }
+    });
+
+    const results = await pool(safeTasks, CFG.CONCURRENCY);
+    results.forEach((r, i) => {
+      const c = targets[i];
+      if (r.ok) {
+        items = items.concat(r.value.items);
+        diag.push({
+          name: c.name,
+          ok: true,
+          count: r.value.items.length,
+          pages: r.value.pages,
+          host: r.value.host,
+          retired: !!c.isretire,
+        });
+      } else {
+        const msg = r.error && r.error.message ? r.error.message : String(r.error);
+        warnings.push({ course: c.name, message: msg });
+        diag.push({ name: c.name, ok: false, count: 0, pages: 0, error: msg, retired: !!c.isretire });
       }
     });
 
@@ -753,7 +904,16 @@
       return String(a.title).localeCompare(String(b.title), 'zh');
     });
 
-    return { items, warnings, scannedAt: Date.now(), courseCount: targets.length, retiredSkipped: retriedCount };
+    return {
+      items,
+      warnings,
+      diag,
+      scannedAt: Date.now(),
+      courseCount: targets.length,
+      totalCourses: courses.length,
+      retiredAll,
+      retiredSkipped: courses.length - targets.length,
+    };
   }
 
   function filterItems(items, s) {
@@ -845,114 +1005,166 @@
    * 8. UI
    * ========================================================================== */
 
-  function injectStyle() {
-    GM_addStyle(`
-.cxd-fab{position:fixed;right:22px;bottom:26px;z-index:2147483000;width:52px;height:52px;border-radius:50%;
-  background:linear-gradient(135deg,#4f7cff,#3457d5);color:#fff;display:flex;align-items:center;justify-content:center;
-  font-size:22px;cursor:pointer;box-shadow:0 6px 20px rgba(52,87,213,.35);user-select:none;
-  transition:transform .16s ease,box-shadow .16s ease;font-family:system-ui,-apple-system,"PingFang SC",sans-serif}
-.cxd-fab:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(52,87,213,.45)}
-.cxd-fab .cxd-badge{position:absolute;top:-4px;right:-4px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;
-  background:#e5484d;color:#fff;font-size:11px;line-height:20px;text-align:center;font-weight:600;border:2px solid #fff}
-.cxd-fab .cxd-badge.hide{display:none}
+  const CSS_TEXT = `
+:host{all:initial}
+.cxd-fab{position:fixed;right:22px;bottom:26px;width:54px;height:54px;border-radius:18px;
+  background:linear-gradient(140deg,#5b86ff,#3457d5);color:#fff;display:flex;align-items:center;
+  justify-content:center;cursor:pointer;box-shadow:0 8px 24px rgba(52,87,213,.36);
+  transition:transform .18s ease,box-shadow .18s ease;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.cxd-fab:hover{transform:translateY(-3px);box-shadow:0 12px 32px rgba(52,87,213,.46)}
+.cxd-badge{position:absolute;top:-4px;right:-4px;min-width:20px;height:20px;padding:0 5px;
+  border-radius:10px;background:#f04438;color:#fff;font-size:11px;line-height:16px!important;
+  text-align:center;font-weight:700;border:2px solid #fff;box-sizing:border-box;
+  font-variant-numeric:tabular-nums}
+.cxd-badge.hide{display:none}
 
-.cxd-panel{position:fixed;right:22px;bottom:90px;z-index:2147483001;width:400px;max-height:72vh;
-  background:#fff;border-radius:14px;box-shadow:0 18px 50px rgba(15,23,42,.18),0 2px 8px rgba(15,23,42,.08);
-  display:none;flex-direction:column;overflow:hidden;border:1px solid #e6e9f0;
-  font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1a2233}
+.cxd-panel{position:fixed;right:22px;bottom:94px;width:420px;max-height:76vh;background:#fff;
+  border-radius:18px;box-shadow:0 24px 64px rgba(15,23,42,.20),0 4px 14px rgba(15,23,42,.06);
+  display:none;flex-direction:column;overflow:hidden;border:1px solid rgba(15,23,42,.07);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  color:#101828;font-size:13px;line-height:1.5!important;text-align:left;letter-spacing:normal}
 .cxd-panel.open{display:flex}
+.cxd-panel *{box-sizing:border-box}
 
-.cxd-head{display:flex;align-items:center;gap:8px;padding:14px 16px 12px;border-bottom:1px solid #eef1f6}
-.cxd-head h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.2px;flex:1}
-.cxd-head .cxd-sub{font-size:11px;color:#8b95a7;font-weight:400;margin-top:2px}
-.cxd-icon-btn{border:0;background:transparent;cursor:pointer;color:#8b95a7;font-size:18px;line-height:1;
-  padding:4px 6px;border-radius:6px}
-.cxd-icon-btn:hover{background:#f2f4f8;color:#3b4557}
+/* 核心修复：清空学习通全局样式对按钮的污染，这是标签文字被压扁的根因 */
+.cxd-panel button{all:unset;box-sizing:border-box;cursor:pointer;display:inline-flex;
+  align-items:center;justify-content:center;font-family:inherit;font-size:12px;
+  line-height:1!important;color:inherit;white-space:nowrap;overflow:visible;text-align:center;
+  vertical-align:middle;-webkit-appearance:none;appearance:none;letter-spacing:normal}
 
-.cxd-stats{display:flex;gap:6px;padding:10px 16px 0}
-.cxd-stat{flex:1;background:#f7f9fc;border-radius:9px;padding:8px 10px;text-align:center}
-.cxd-stat b{display:block;font-size:17px;line-height:1.2}
-.cxd-stat span{font-size:10.5px;color:#8b95a7}
-.cxd-stat.red b{color:#e5484d}
-.cxd-stat.orange b{color:#e08b0a}
+.cxd-head{display:flex;align-items:flex-start;gap:10px;padding:16px 16px 12px}
+.cxd-h1{font-size:15px!important;font-weight:700;letter-spacing:.2px;line-height:1.3!important}
+.cxd-sub{font-size:11.5px!important;color:#8b95a7;margin-top:3px;line-height:1.4!important;
+  max-width:262px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cxd-acts{display:flex;gap:2px;margin-left:auto;flex:0 0 auto}
+.cxd-ico{width:30px;height:30px;border-radius:9px;color:#8b95a7!important;padding:0!important}
+.cxd-ico:hover{background:#f1f4fa;color:#334155!important}
+.cxd-ico svg{display:block;pointer-events:none}
+
+.cxd-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:0 16px 12px}
+.cxd-stat{background:#f7f9fd;border:1px solid #eef2f9;border-radius:12px;padding:9px 6px;text-align:center}
+.cxd-stat b{display:block;font-size:19px;line-height:1.25!important;font-weight:700;
+  font-variant-numeric:tabular-nums;color:#334155}
+.cxd-stat span{font-size:10.5px;color:#8b95a7;line-height:1.4!important}
+.cxd-stat.red b{color:#f04438}
+.cxd-stat.amber b{color:#e08b0a}
 .cxd-stat.blue b{color:#3457d5}
 
-.cxd-tabs{display:flex;gap:4px;padding:10px 12px 8px;overflow-x:auto;scrollbar-width:none}
-.cxd-tabs::-webkit-scrollbar{display:none}
-.cxd-tab{flex:0 0 auto;border:0;background:#f2f4f8;color:#5b6478;font-size:11.5px;padding:5px 10px;
-  border-radius:20px;cursor:pointer;white-space:nowrap;font-family:inherit}
-.cxd-tab.on{background:#3457d5;color:#fff}
-.cxd-tab .n{opacity:.65;margin-left:3px}
+.cxd-tabs{display:flex;gap:6px;padding:0 14px 10px;overflow-x:auto;overflow-y:hidden}
+.cxd-tabs:empty{display:none;padding:0}
+.cxd-tabs::-webkit-scrollbar{height:0}
+.cxd-tab{height:28px!important;min-height:28px!important;padding:0 11px!important;border-radius:14px!important;
+  background:#f2f5fa!important;color:#5b6478!important;font-size:12px!important;
+  display:inline-flex!important;align-items:center!important;justify-content:center!important;
+  line-height:1!important;white-space:nowrap!important;overflow:visible!important;
+  transition:background .15s,color .15s}
+.cxd-tab:hover{background:#eaeef6!important}
+.cxd-tab.on{background:#3457d5!important;color:#fff!important;font-weight:600}
+.cxd-tab .n{opacity:.62;margin-left:4px;font-variant-numeric:tabular-nums}
+.cxd-tab.on .n{opacity:.86}
 
-.cxd-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:2px 10px 10px}
-.cxd-empty{text-align:center;color:#9aa4b6;font-size:12.5px;padding:36px 12px;line-height:1.7}
-.cxd-warn{background:#fff8e6;border:1px solid #f7e2b0;color:#8a6314;font-size:11px;border-radius:8px;
-  padding:8px 10px;margin:4px 6px 8px;line-height:1.6}
+.cxd-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:0 8px 8px}
+.cxd-list::-webkit-scrollbar{width:8px}
+.cxd-list::-webkit-scrollbar-thumb{background:#dfe5ef;border-radius:4px}
+.cxd-list::-webkit-scrollbar-thumb:hover{background:#cbd4e2}
+.cxd-empty{text-align:center;color:#9aa4b6;font-size:12.5px!important;padding:40px 16px;line-height:1.8!important}
+.cxd-warn{background:#fff8e6;border:1px solid #f7e2b0;color:#8a6314;font-size:11.5px!important;
+  border-radius:10px;padding:9px 11px;margin:2px 6px 8px;line-height:1.6!important}
 
-.cxd-item{display:flex;gap:9px;padding:9px 8px;border-radius:9px;cursor:default}
-.cxd-item:hover{background:#f7f9fc}
-.cxd-dot{flex:0 0 auto;width:5px;border-radius:3px;background:#cfd6e4;margin-top:2px}
-.cxd-item.u .cxd-dot{background:#e5484d}
-.cxd-item.s .cxd-dot{background:#e08b0a}
-.cxd-item.n .cxd-dot{background:#30a46c}
-.cxd-item.dim{opacity:.5}
+.cxd-item{display:flex;gap:10px;padding:10px;border-radius:12px;border:1px solid transparent;
+  transition:background .14s,border-color .14s}
+.cxd-item:hover{background:#f8fafd;border-color:#eef2f9}
+.cxd-dot{flex:0 0 auto;width:3px;border-radius:2px;background:#d3dae6;margin:2px 0}
+.cxd-item.u .cxd-dot{background:#f04438}
+.cxd-item.s .cxd-dot{background:#f59e0b}
+.cxd-item.n .cxd-dot{background:#12b76a}
+.cxd-item.dim{opacity:.55}
 .cxd-body{flex:1;min-width:0}
-.cxd-title{font-size:12.5px;line-height:1.45;color:#1a2233;display:block;text-decoration:none;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.cxd-title:hover{color:#3457d5;text-decoration:underline}
-.cxd-meta{font-size:10.5px;color:#8b95a7;margin-top:3px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.cxd-tag{background:#eef1f6;color:#5b6478;padding:1px 5px;border-radius:4px;font-size:10px}
-.cxd-tag.exam{background:#fdeaea;color:#c93b40}
+.cxd-title{font-size:13px!important;line-height:1.45!important;color:#101828;text-decoration:none;
+  display:-webkit-box!important;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.cxd-title:hover{color:#3457d5}
+.cxd-meta{font-size:11px!important;color:#8b95a7;margin-top:5px;display:flex;gap:6px;flex-wrap:wrap;
+  align-items:center;line-height:1.5!important}
+.cxd-tag{background:#f1f4fa;color:#5b6478;padding:1px 6px;border-radius:5px;
+  font-size:10.5px!important;line-height:1.7!important}
+.cxd-tag.exam{background:#fdecec;color:#c93b40}
 .cxd-tag.notice{background:#eaf3fd;color:#2b6cb0}
-.cxd-tag.peer{background:#f3ebfd;color:#7a45c4}
-.cxd-left{font-size:11px;font-weight:600;white-space:nowrap}
-.cxd-item.u .cxd-left{color:#e5484d}
+.cxd-tag.peer{background:#f4ecfe;color:#7a45c4}
+.cxd-left{font-size:11.5px!important;font-weight:700;white-space:nowrap;padding-top:1px;
+  font-variant-numeric:tabular-nums;flex:0 0 auto}
+.cxd-item.u .cxd-left{color:#f04438}
 .cxd-item.s .cxd-left{color:#e08b0a}
-.cxd-item.n .cxd-left{color:#30a46c}
+.cxd-item.n .cxd-left{color:#12b76a}
 .cxd-item.dim .cxd-left{color:#9aa4b6}
 
-.cxd-foot{border-top:1px solid #eef1f6;padding:9px 12px;display:flex;gap:6px;background:#fbfcfe}
-.cxd-btn{flex:1 1 0;border:1px solid #dfe4ee;background:#fff;color:#3b4557;font-size:11.5px;padding:7px 6px;
-  border-radius:8px;cursor:pointer;font-family:inherit;transition:.14s;white-space:nowrap}
-.cxd-btn:hover{border-color:#3457d5;color:#3457d5}
-.cxd-btn.primary{background:#3457d5;border-color:#3457d5;color:#fff}
-.cxd-btn.primary:hover{background:#2b49b8}
+.cxd-foot{padding:10px 12px;display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:8px;
+  border-top:1px solid #eef2f9;background:#fbfcfe}
+.cxd-btn{height:34px!important;border-radius:10px!important;border:1px solid #e2e8f2!important;
+  background:#fff!important;color:#42506b!important;font-size:12px!important;transition:.15s}
+.cxd-btn:hover{border-color:#3457d5!important;color:#3457d5!important}
+.cxd-btn.primary{background:#3457d5!important;border-color:#3457d5!important;color:#fff!important;font-weight:600}
+.cxd-btn.primary:hover{background:#2b49b8!important;color:#fff!important}
 .cxd-btn:disabled{opacity:.5;cursor:not-allowed}
 
-.cxd-progress{font-size:11px;color:#8b95a7;padding:10px 16px;text-align:center}
+.cxd-progress{font-size:12px;color:#8b95a7;padding:34px 16px;text-align:center;line-height:1.8}
+.cxd-bar{height:3px;background:#eef2f9;border-radius:2px;margin-top:12px;overflow:hidden}
+.cxd-bar i{display:block;height:100%;background:linear-gradient(90deg,#5b86ff,#3457d5);
+  border-radius:2px;transition:width .3s ease}
 
-.cxd-settings{padding:12px 16px;overflow-y:auto;font-size:12px}
-.cxd-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;
-  border-bottom:1px dashed #eef1f6}
+.cxd-settings{padding:4px 16px 14px;overflow-y:auto}
+.cxd-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;
+  border-bottom:1px solid #f1f4fa}
 .cxd-row:last-child{border-bottom:0}
-.cxd-row label{color:#3b4557}
-.cxd-row .hint{font-size:10.5px;color:#9aa4b6;display:block;margin-top:2px}
-.cxd-switch{position:relative;width:36px;height:20px;flex:0 0 auto;cursor:pointer}
+.cxd-row label{color:#26324a;font-size:12.5px!important;line-height:1.5!important}
+.cxd-row .hint{font-size:11px!important;color:#9aa4b6;display:block;margin-top:2px;line-height:1.45!important}
+.cxd-switch{position:relative;width:38px;height:22px;flex:0 0 auto;cursor:pointer;display:block}
 .cxd-switch input{opacity:0;width:0;height:0;position:absolute}
-.cxd-switch i{position:absolute;inset:0;background:#cfd6e4;border-radius:20px;transition:.18s}
-.cxd-switch i:before{content:"";position:absolute;width:16px;height:16px;left:2px;top:2px;
-  background:#fff;border-radius:50%;transition:.18s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+.cxd-switch i{position:absolute;inset:0;background:#d7dde8;border-radius:22px;transition:.2s}
+.cxd-switch i:before{content:"";position:absolute;width:18px;height:18px;left:2px;top:2px;
+  background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.22)}
 .cxd-switch input:checked + i{background:#3457d5}
 .cxd-switch input:checked + i:before{transform:translateX(16px)}
 
-.cxd-rem{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
-.cxd-rem button{border:1px solid #dfe4ee;background:#fff;color:#5b6478;font-size:11px;padding:4px 9px;
-  border-radius:14px;cursor:pointer;font-family:inherit}
-.cxd-rem button.on{background:#3457d5;border-color:#3457d5;color:#fff}
+.cxd-rem{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px}
+.cxd-rem button{height:30px!important;padding:0 12px!important;border:1px solid #e2e8f2!important;
+  background:#fff!important;color:#5b6478!important;font-size:12px!important;border-radius:15px!important}
+.cxd-rem button.on{background:#3457d5!important;border-color:#3457d5!important;color:#fff!important}
+
+.cxd-diag{padding:2px 14px 14px}
+.cxd-dsum{font-size:12px!important;color:#5b6478;line-height:1.8!important;padding:6px 2px 10px}
+.cxd-dsum b{color:#101828}
+.cxd-drow{display:flex;gap:10px;align-items:baseline;padding:7px 2px;border-bottom:1px solid #f4f6fa}
+.cxd-dname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:#26324a;font-size:12px}
+.cxd-dnum{font-variant-numeric:tabular-nums;font-weight:700;color:#12b76a;flex:0 0 auto;font-size:12px}
+.cxd-dnum.zero{color:#9aa4b6}
+.cxd-dnum.bad{color:#f04438}
+.cxd-dwhy{font-size:10.5px;color:#9aa4b6;padding:0 2px 6px}
+
 @media (max-width:520px){
-  .cxd-panel{right:8px;left:8px;width:auto;bottom:84px;max-height:76vh}
+  .cxd-panel{right:8px;left:8px;width:auto;bottom:88px;max-height:78vh}
   .cxd-fab{right:14px;bottom:18px}
 }
-`);
+`;
+
+  function injectStyle(root) {
+    const st = document.createElement('style');
+    st.textContent = CSS_TEXT;
+    root.appendChild(st);
   }
 
   const state = {
     items: [],
     warnings: [],
+    diag: [],
     filter: 'all',
     loading: false,
     view: 'list',
     scannedAt: 0,
+    courseCount: 0,
+    totalCourses: 0,
+    progress: { done: 0, total: 0 },
     timer: null,
   };
 
@@ -973,29 +1185,64 @@
     return 'n';
   }
 
+  const ICON = {
+    cal:
+      '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M16 3v4M8 3v4M3 10.5h18"/>' +
+      '<path d="M8 15h3"/></svg>',
+    cog:
+      '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<circle cx="12" cy="12" r="3"/>' +
+      '<path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34' +
+      ' 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34' +
+      'l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4' +
+      'h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06' +
+      'a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56' +
+      ' 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9' +
+      'a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>',
+    list:
+      '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>',
+    x:
+      '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M18 6L6 18M6 6l12 12"/></svg>',
+  };
+
   function buildUI() {
+    // 整块 UI 挂在 Shadow DOM 里：学习通的全局 CSS 进不来，按钮不会再被压扁
+    const host = document.createElement('div');
+    host.id = 'cxd-host';
+    host.style.cssText = 'all:initial';
+    const root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+    UI_ROOT = root;
+    injectStyle(root);
+
     const fab = document.createElement('div');
     fab.className = 'cxd-fab';
-    fab.innerHTML =
-    '<svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-    'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-    '<rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M16 3v4M8 3v4M3 10.5h18"/>' +
-    '</svg><span class="cxd-badge hide">0</span>';
+    fab.id = 'cxd-fab';
+    fab.innerHTML = ICON.cal + '<span class="cxd-badge hide">0</span>';
 
     const panel = document.createElement('div');
     panel.className = 'cxd-panel';
     panel.innerHTML = `
       <div class="cxd-head">
-        <div style="flex:1">
-          <h1>学习通 · 截止倒计时</h1>
+        <div style="min-width:0">
+          <div class="cxd-h1">学习通 · 截止倒计时</div>
           <div class="cxd-sub" id="cxd-sub">点击「刷新」开始扫描</div>
         </div>
-        <button class="cxd-icon-btn" id="cxd-set-btn" title="设置">⚙</button>
-        <button class="cxd-icon-btn" id="cxd-close" title="关闭">×</button>
+        <div class="cxd-acts">
+          <button class="cxd-ico" id="cxd-diag-btn" title="诊断：每门课抓到多少条">${ICON.list}</button>
+          <button class="cxd-ico" id="cxd-set-btn" title="设置">${ICON.cog}</button>
+          <button class="cxd-ico" id="cxd-close" title="关闭">${ICON.x}</button>
+        </div>
       </div>
       <div class="cxd-stats">
         <div class="cxd-stat red"><b id="cxd-s-urgent">0</b><span>24h 内</span></div>
-        <div class="cxd-stat orange"><b id="cxd-s-week">0</b><span>72h 内</span></div>
+        <div class="cxd-stat amber"><b id="cxd-s-week">0</b><span>72h 内</span></div>
         <div class="cxd-stat blue"><b id="cxd-s-all">0</b><span>全部待办</span></div>
       </div>
       <div class="cxd-tabs" id="cxd-tabs"></div>
@@ -1007,8 +1254,9 @@
       </div>
     `;
 
-    document.body.appendChild(fab);
-    document.body.appendChild(panel);
+    root.appendChild(fab);
+    root.appendChild(panel);
+    document.documentElement.appendChild(host);
 
     fab.addEventListener('click', () => {
       panel.classList.toggle('open');
@@ -1018,8 +1266,9 @@
       }
     });
     $('#cxd-close').addEventListener('click', () => panel.classList.remove('open'));
-    $('#cxd-refresh').addEventListener('click', () => refresh());
-    $('#cxd-set-btn').addEventListener('click', () => toggleSettings());
+    $('#cxd-refresh').addEventListener('click', () => refresh(true));
+    $('#cxd-set-btn').addEventListener('click', toggleSettings);
+    $('#cxd-diag-btn').addEventListener('click', toggleDiag);
     $('#cxd-ics').addEventListener('click', onExportIcs);
     $('#cxd-md').addEventListener('click', onCopyMemo);
 
@@ -1038,8 +1287,14 @@
     render();
   }
 
+  function toggleDiag() {
+    state.view = state.view === 'diag' ? 'list' : 'diag';
+    render();
+  }
+
   function render() {
     if (state.view === 'settings') return renderSettings();
+    if (state.view === 'diag') return renderDiag();
     renderList();
     renderTabs();
     renderStats();
@@ -1063,10 +1318,15 @@
     }
 
     const sub = $('#cxd-sub');
-    if (state.loading) sub.textContent = '正在扫描…';
-    else if (state.scannedAt) {
+    if (state.loading) {
+      sub.textContent = state.progress.total
+        ? `正在扫描 ${state.progress.done}/${state.progress.total} 门课程…`
+        : '正在获取课程列表…';
+    } else if (state.scannedAt) {
       const t = new Date(state.scannedAt);
-      sub.textContent = `上次扫描 ${pad2(t.getHours())}:${pad2(t.getMinutes())} · ${state.items.length} 项`;
+      sub.textContent =
+        `${pad2(t.getHours())}:${pad2(t.getMinutes())} 扫描 · ` +
+        `${state.courseCount} 门课 · ${state.items.length} 项`;
     } else sub.textContent = '点击「刷新」开始扫描';
   }
 
@@ -1108,10 +1368,58 @@
     }
   }
 
+  function renderDiag() {
+    const box = $('#cxd-list');
+    $('#cxd-tabs').innerHTML = '';
+    const d = state.diag || [];
+    if (!d.length) {
+      box.innerHTML =
+        '<div class="cxd-empty">还没有扫描记录<br>先点「刷新」扫一次，再回来看每门课抓到多少条</div>';
+      return;
+    }
+    const withItems = d.filter((x) => x.ok && x.count > 0).length;
+    const zero = d.filter((x) => x.ok && x.count === 0).length;
+    const failed = d.filter((x) => !x.ok).length;
+
+    box.innerHTML = `
+      <div class="cxd-diag">
+        <div class="cxd-dsum">
+          共扫描 <b>${d.length}</b> 门课程，<b>${withItems}</b> 门抓到条目${
+      zero ? `，<b>${zero}</b> 门为 0 条` : ''
+    }${failed ? `，<b>${failed}</b> 门失败` : ''}。<br>
+          0 条不一定有错（可能确实没作业）；但如果你确定它有，说明解析没命中，把这份诊断发到 issue 里。
+        </div>
+        <button class="cxd-btn primary" id="cxd-diag-copy" style="width:100%;margin-bottom:10px">复制诊断信息</button>
+        ${d
+          .map(
+            (x) => `
+          <div class="cxd-drow">
+            <div class="cxd-dname" title="${escapeHtml(x.name)}">${escapeHtml(x.name)}${
+              x.retired ? ' · 已结课' : ''
+            }</div>
+            <div class="cxd-dnum ${x.ok ? (x.count ? '' : 'zero') : 'bad'}">${
+              x.ok ? x.count + ' 条' : '失败'
+            }</div>
+          </div>
+          ${!x.ok ? `<div class="cxd-dwhy">${escapeHtml(x.error || '')}</div>` : ''}`
+          )
+          .join('')}
+      </div>`;
+
+    const cp = $('#cxd-diag-copy');
+    if (cp) cp.addEventListener('click', onCopyDiag);
+  }
+
   function renderList() {
     const box = $('#cxd-list');
     if (state.loading && !state.items.length) {
-      box.innerHTML = '<div class="cxd-progress">正在扫描全部课程，请稍候…</div>';
+      const p = state.progress;
+      const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+      box.innerHTML = `<div class="cxd-progress">
+        正在扫描全部课程，请稍候…<br>
+        <span style="font-size:11.5px">${p.total ? p.done + ' / ' + p.total + ' 门' : '获取课程列表'}</span>
+        <div class="cxd-bar"><i style="width:${pct}%"></i></div>
+      </div>`;
       return;
     }
     if (!state.items.length) {
@@ -1129,8 +1437,8 @@
       w.className = 'cxd-warn';
       w.innerHTML =
         '⚠ 部分课程未取到：' +
-        state.warnings.slice(0, 3).map((x) => `${x.course}（${x.message}）`).join('；') +
-        (state.warnings.length > 3 ? ` 等 ${state.warnings.length} 项` : '');
+        state.warnings.slice(0, 3).map((x) => `${escapeHtml(x.course)}（${escapeHtml(x.message)}）`).join('；') +
+        (state.warnings.length > 3 ? ` 等 ${state.warnings.length} 项，详见「诊断」` : '');
       box.appendChild(w);
     }
 
@@ -1153,7 +1461,6 @@
           : '已截止'
         : '—';
 
-      const tagCls = it.kind === 'exam' ? 'exam' : it.kind === 'notice' ? 'notice' : '';
       const kindTag =
         it.kind === 'exam'
           ? '<span class="cxd-tag exam">考试</span>'
@@ -1198,7 +1505,12 @@
     tabs.innerHTML = '';
     box.innerHTML = `
       <div class="cxd-settings">
-        <div class="cxd-row">
+        <div class="cxd-row" style="padding:6px 0 12px">
+          <div><label style="font-size:13.5px">扫描与提醒设置</label><span class="hint">改动即时保存</span></div>
+          <button class="cxd-btn primary" id="cxd-set-back"
+                  style="height:30px!important;width:auto;padding:0 14px;flex:0 0 auto">重新扫描</button>
+        </div>
+        <div class="cxd-row" style="border-bottom:0;padding-bottom:0">
           <div><label>启用提醒</label><span class="hint">选中的提前量会写进日历事件的闹钟</span></div>
         </div>
         <div class="cxd-rem" id="cxd-rem">
@@ -1220,10 +1532,7 @@
         ${switchRow('includeGrading', '包含待批阅', '已提交但老师还没批的', s.includeGrading)}
         ${switchRow('withNotices', '包含未读通知', '实验性：接口可能随平台调整而失效', s.withNotices)}
         ${switchRow('includeExpired', '包含已过期', '默认隐藏，避免干扰', s.includeExpired)}
-        ${switchRow('hideRetired', '跳过已结课', '减少无效请求，降低风控风险', s.hideRetired)}
-        <div class="cxd-row" style="padding-top:12px">
-          <button class="cxd-btn primary" id="cxd-set-back">返回列表</button>
-        </div>
+        ${switchRow('hideRetired', '跳过已结课', '默认关闭：结课课程里也可能有没交的作业', s.hideRetired)}
       </div>
     `;
 
@@ -1251,7 +1560,7 @@
     $('#cxd-set-back').addEventListener('click', () => {
       state.view = 'list';
       render();
-      refresh();
+      refresh(true);
     });
   }
 
@@ -1279,34 +1588,81 @@
       if (cached && Date.now() - cached.at < CFG.SCAN_TTL) {
         state.items = cached.items;
         state.warnings = cached.warnings || [];
+        state.diag = cached.diag || [];
         state.scannedAt = cached.at;
+        state.courseCount = cached.courseCount || 0;
         render();
         return;
       }
     }
 
     state.loading = true;
+    state.progress = { done: 0, total: 0 };
     render();
     try {
       const res = await scanAll(s, (p) => {
+        if (p.stage === 'works') state.progress = { done: p.done, total: p.total };
         const sub = $('#cxd-sub');
         if (!sub) return;
         if (p.stage === 'courses') sub.textContent = '正在获取课程列表…';
         else if (p.stage === 'works')
-          sub.textContent = `正在扫描作业 ${p.done}/${p.total}：${p.course || ''}`;
+          sub.textContent = `正在扫描 ${p.done}/${p.total}：${p.course || ''}`;
         else if (p.stage === 'exams') sub.textContent = '正在获取考试列表…';
         else if (p.stage === 'notices') sub.textContent = '正在获取未读通知…';
+        if (state.view === 'list' && state.loading && !state.items.length) renderList();
       });
       state.items = res.items;
       state.warnings = res.warnings;
+      state.diag = res.diag || [];
       state.scannedAt = res.scannedAt;
-      GM_setValue(STORE.scan, { at: res.scannedAt, items: res.items, warnings: res.warnings });
+      state.courseCount = res.courseCount || 0;
+      state.totalCourses = res.totalCourses || res.courseCount || 0;
+      GM_setValue(STORE.scan, {
+        at: res.scannedAt,
+        items: res.items,
+        warnings: res.warnings,
+        diag: res.diag || [],
+        courseCount: res.courseCount || 0,
+      });
     } catch (e) {
       state.warnings = [{ course: '扫描', message: e.message || String(e) }];
       console.error('[chaoxing-deadline]', e);
     } finally {
       state.loading = false;
       render();
+    }
+  }
+
+  async function onCopyDiag() {
+    const d = state.diag || [];
+    const lines = [
+      '学习通作业倒计时 · 诊断信息',
+      '时间：' + new Date().toLocaleString('zh-CN'),
+      '脚本版本：1.1.0',
+      'UA：' + navigator.userAgent,
+      '课程数：' + d.length,
+      '',
+    ];
+    for (const x of d) {
+      lines.push(
+        (x.ok ? x.count + ' 条' : '失败') +
+          '\t' +
+          (x.name || '未命名') +
+          (x.retired ? '（已结课）' : '') +
+          (x.ok ? '' : '：' + (x.error || ''))
+      );
+    }
+    const text = lines.join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      const btn = $('#cxd-diag-copy');
+      if (btn) {
+        const old = btn.textContent;
+        btn.textContent = '已复制 ✓';
+        setTimeout(() => (btn.textContent = old), 1500);
+      }
+    } catch (e) {
+      download('学习通诊断.txt', text, 'text/plain');
     }
   }
 
@@ -1347,9 +1703,8 @@
     } catch (e) {
       return;
     }
-    if (document.getElementById('cxd-fab')) return;
+    if (document.getElementById('cxd-host')) return;
 
-    injectStyle();
     buildUI();
     render();
 
@@ -1358,7 +1713,9 @@
     if (cached) {
       state.items = cached.items || [];
       state.warnings = cached.warnings || [];
+      state.diag = cached.diag || [];
       state.scannedAt = cached.at || 0;
+      state.courseCount = cached.courseCount || 0;
       render();
     }
   }

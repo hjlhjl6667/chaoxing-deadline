@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/hjlhjl6667/chaoxing-deadline/actions/workflows/test.yml/badge.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/releases)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-✓-orange.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/raw/main/chaoxing-deadline.user.js)
 
 > 把学习通的作业截止时间，变成你手机日历里的**真实闹钟**。
@@ -126,10 +126,15 @@ node tools/gen-calendar-preview.mjs   # 改了 demo.ics 后重新生成
 
 ### 其他
 
+- **诊断**：右上角列表图标。逐门课列出「抓到几条」，0 条和失败都会显示。**怀疑漏课时先看这里**
 - **复制清单**：把待办导出成 Markdown，适合贴进 Notion / Obsidian / 备忘录
 - **设置**：可开关「包含考试」「包含待互评」「包含待批阅」「包含未读通知」「包含已过期」「跳过已结课」
 - 扫描结果缓存 5 分钟，课程列表缓存 30 分钟，避免反复请求
 - 倒计时每 30 秒自动刷新，不用手动重开面板
+
+![诊断视图](assets/diag.png)
+
+<sub>诊断视图：每门课抓到多少条一目了然。0 条不一定是错的，但如果你确定那门课有作业，就说明解析没命中。</sub>
 
 ---
 
@@ -138,17 +143,24 @@ node tools/gen-calendar-preview.mjs   # 改了 demo.ics 后重新生成
 学习通没有公开 API，全部走网页接口 + 你已有的登录态。链路如下（详见 [`docs/API.md`](docs/API.md)）：
 
 ```
-GET  mooc1-api.chaoxing.com/mycourse/backclazzdata        → 全部课程（courseId / classId / cpi）
-GET  mooc1.chaoxing.com/visit/stucoursemiddle             → 课程中间页，提取 workEnc 与 stuenc
-GET  mooc1.chaoxing.com/mooc-ans/mooc2/work/list          → 作业列表 HTML（需 enc + t + stuenc）
-GET  mooc1-api.chaoxing.com/exam-ans/exam/test/...        → 考试列表
-POST notice.chaoxing.com/pc/notice/getNoticeList          → 未读通知
+① 课程来源 A  GET  mooc1-api.chaoxing.com/mycourse/backclazzdata   → 频道列表
+   课程来源 B  POST mooc1.chaoxing.com/visit/courselistdata         → 课程页 HTML（补漏）
+   ↓ 两个来源合并去重 → courseId / classId / cpi
+② GET  mooc1.chaoxing.com/visit/stucoursemiddle                    → workEnc 与 stuenc
+        （失败则自动换 mooc2-ans.chaoxing.com 再试一次）
+③ GET  mooc1.chaoxing.com/mooc-ans/mooc2/work/list                 → 作业列表 HTML
+        逐页翻完（pageNum），返回空则换站重试
+④ GET  mooc1-api.chaoxing.com/exam-ans/exam/test/...               → 考试列表
+⑤ POST notice.chaoxing.com/pc/notice/getNoticeList                 → 未读通知
 ```
 
-两个容易踩的点，本项目都处理了：
+几个容易踩的点，本项目都处理了：
 
 1. **`work/list` 只给 `enc` 会返回「无权限」**，必须同时带上 `t`（时间戳）和 `stuenc`。很多文档没写这条。
-2. **列表页不给绝对截止时间**，只给「剩余90小时37分钟」这种相对描述。本项目的做法是「扫描时刻 + 剩余时长」反推绝对时间，误差在秒级，对分钟级提醒完全够用。设置里另有「精确模式」可开（会走作业详情页读绝对时间，但请求量翻倍，风控风险更高）。
+2. **一个频道里可能挂多门课**。`channelList[].content.course.data` 是数组，只取 `[0]` 会整门课消失 —— 这是「有些课明明有作业却统计不到」的常见原因。
+3. **作业列表是分页的**。只取第一页，作业多的课程会漏掉后面几页。
+4. **不同版本的课程挂在不同的站点上**。新版课程在 `mooc2-ans`，老版在 `mooc1`，路径也不同（`/mooc2/work/list` vs `/mooc-ans/mooc2/work/list`）。脚本两个都试。
+5. **列表页不给绝对截止时间**，只给「剩余90小时37分钟」这种相对描述。本项目的做法是「扫描时刻 + 剩余时长」反推绝对时间，误差在秒级，对分钟级提醒完全够用。设置里另有「精确模式」可开（会走作业详情页读绝对时间，但请求量翻倍，风控风险更高）。
 
 ---
 
@@ -159,7 +171,7 @@ POST notice.chaoxing.com/pc/notice/getNoticeList          → 未读通知
 - 本脚本通过自动化请求读取你的作业数据。**学习通可能对此触发风控**，表现为要求输入验证码或临时限制部分功能。介意的话请不要使用。
 - 脚本**不收集、不上传任何数据**。没有后端，没有统计，没有远程配置。所有信息只存在于你的浏览器本地（`GM_setValue`）和导出的 `.ics` 文件里。
 - 脚本**不接触你的密码**。它复用浏览器已有的 Cookie。
-- 为降低风险：并发 3 路、同课程翻页间隔 500ms、已结课课程默认跳过、结果缓存 5 分钟。请勿在短时间内反复点「刷新」。
+- 为降低风险：并发 3 路、同课程翻页间隔 500ms、结果缓存 5 分钟。想进一步减少请求，可在设置里打开「跳过已结课」。请勿在短时间内反复点「刷新」。
 
 ---
 
@@ -169,7 +181,8 @@ POST notice.chaoxing.com/pc/notice/getNoticeList          → 未读通知
 - 依赖平台的 HTML 结构，学习通改版会导致解析失效。脚本已做多套选择器兜底，但改版严重时仍需跟进更新。
 - 「未读通知」模块是**实验性**的：通知接口的参数随平台调整，可能失效。失效时其他功能不受影响。
 - 相对时间反推有秒级误差；跨天边界（比如「剩余 0 分钟」）可能落到前一分钟。
-- 已结课判断基于 `isretire` 与 `endDate`，个别课程可能误判，可在设置里关掉「跳过已结课」。
+- 已结课判断基于 `isretire` 与 `endDate`，个别课程可能误判。默认**不跳过**已结课课程，可在设置里打开。
+- 如果你确定某门课有作业但显示 0 条，请打开「诊断」复制信息提 issue —— 那说明选择器没命中，需要按实际页面结构补规则。
 
 ---
 
@@ -183,9 +196,37 @@ node tools/gen-demo.mjs     # 重新生成 examples/demo.ics
 node tools/gen-calendar-preview.mjs   # 重新生成可视化验证页
 ```
 
+抓取逻辑用假数据做了端到端验证，不需要登录学习通：
+
+```
+tools/e2e-scan.html    # 浏览器打开，页面会把扫描结果以 JSON 打印出来
+```
+
+它模拟了这几种真实情况：一个频道挂多门课、频道接口漏掉的课只在课程页出现、
+作业列表分两页、某门课只有 mooc2-ans 有数据、某门课取不到 `workEnc`。
+用例覆盖了 v1.1.0 修的全部漏课原因，改解析逻辑后先跑它。
+
 测试不是复制一份代码来测，而是把发布文件里标记为 `@testable` 的代码段抽出来在 `vm` 里跑——**测的就是发出去的**。
 
 `window.__CXD__` 暴露了 `API` / `ICS` / `TimeParser` / `scanAll`，可在控制台里调试。
+
+---
+
+## 更新日志
+
+### v1.1.0
+
+- **修复漏课**：课程列表改为「频道接口 + 课程页 HTML」双来源合并去重；一个频道内挂多门课时全部取出（旧版只取第一门，会整门漏掉）
+- **修复漏作业**：作业列表按 `pageNum` 翻完全部分页，页码解析同时识别数字页码与 `pageNum` 链接
+- **兼容新版课程**：`stucoursemiddle` 与 `work/list` 在 mooc1 / mooc2-ans 之间自动切换重试
+- **新增「诊断」视图**：逐门课显示抓取条数，0 条与失败一目了然，可一键复制发给作者
+- **修复标签文字被裁切**：整块 UI 迁入 Shadow DOM，彻底隔离学习通全局 CSS（之前会被页面样式压扁）
+- **UI 重做**：更大的字号与间距、两点行标题、进度条、滚动条美化、图标改内联 SVG
+- 「跳过已结课」默认关闭，避免结课课程里的未交作业被漏掉
+
+### v1.0.0
+
+首个版本：作业 / 考试 / 通知聚合，`.ics` 导出与三档提醒。
 
 ---
 

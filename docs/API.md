@@ -45,6 +45,29 @@ GET https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1
 ```
 
 > 同一门课可能出现在多个频道里，需要按 `courseId + classId` 去重。
+>
+> **`course.data` 是数组，可能有多项。** 只取 `data[0]` 会让同一频道下的其他课程整体消失
+> ——这是「有些课明明有作业却统计不到」最常见的原因。
+
+### 1b. 补充来源：课程页 HTML
+
+频道接口偶尔会漏掉个别课程（新加入的、跨学期归档的）。用课程页再抓一遍补上：
+
+```
+POST https://mooc1.chaoxing.com/visit/courselistdata
+Content-Type: application/x-www-form-urlencoded
+
+courseType=1&courseFolderId=0&baseEducation=0&superstarClass=0
+```
+
+返回 HTML 片段，从链接里取参数：
+
+```
+<a href="/visit/stucoursemiddle?courseid=262350078&clazzid=143971539&cpi=354331126&vc=1">形势与政策</a>
+```
+
+按 `courseid` / `clazzid` / `cpi` 三个参数解析（大小写两种写法都要兼容），
+与频道接口的结果按 `courseId + classId` 合并去重。**两个来源都要走，单靠任何一个都会漏课。**
 
 ---
 
@@ -82,6 +105,37 @@ GET https://mooc1.chaoxing.com/mooc-ans/mooc2/work/list
 > ⚠️ **只传 `enc` 会返回「无权限」**。必须同时带 `t`（毫秒时间戳）和 `stuenc`。这是最容易踩的坑，多数文档漏写。
 >
 > 也有资料说路径是 `mooc1.chaoxing.com/mooc2/work/list`（不带 `mooc-ans`），若 `mooc-ans` 路径 404 可尝试回退。
+
+### 分页
+
+列表页底部有页码容器，**必须翻完所有页**，否则作业多的课程只会拿到第一页：
+
+```html
+<div id="page">
+  <ul>
+    <li>1</li><li>2</li><li>3</li>
+    <li class="next"><a href="?pageNum=2&...">下一页</a></li>
+  </ul>
+</div>
+```
+
+解析方式：容器内纯数字 `li` 的文本 → 页码；`a[href*=pageNum]` 的 query → 页码。两者都取最大值。
+
+```
+GET .../work/list?courseId=..&classId=..&cpi=..&enc=..&t=..&stuenc=..&isdisplaytable=2&pageNum=2
+```
+
+### 两个站点，路径不同
+
+新版课程挂在 `mooc2-ans`，老版在 `mooc1`，且**接口路径不同**：
+
+| 站点 | 作业列表路径 |
+|---|---|
+| `mooc1.chaoxing.com` | `/mooc-ans/mooc2/work/list` |
+| `mooc2-ans.chaoxing.com` | `/mooc2/work/list` |
+
+`stucoursemiddle` 也一样：先试 `mooc1`，取不到 `workEnc` 再试 `mooc2-ans`。
+作业列表第一页返回 0 条时，也要换站重试一次——有些课只有另一站点才有数据。
 
 ### 条目结构
 
@@ -184,4 +238,5 @@ type=&notice_type=&lastValue=&sort=0
 | 重试 | 2 次（仅超时 / 网络错误 / 5xx / 429） |
 | 结果缓存 | 5 分钟 |
 | 课程列表缓存 | 30 分钟 |
-| 已结课课程 | 默认跳过，不请求 |
+| 已结课课程 | 默认也扫描（可在设置里跳过） |
+| 单课程翻页上限 | 50 页 |

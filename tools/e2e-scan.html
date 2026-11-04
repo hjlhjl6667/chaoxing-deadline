@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>扫描逻辑端到端测试</title>
+</head>
+<body>
+<pre id="out">running</pre>
+<script>
+/* ==========================================================================
+ * 用假数据喂真实脚本，验证「课程是否全部扫到」这件事
+ * 覆盖：一个频道多门课 / 两个课程来源合并 / 分页 / 换站重试 / 单课失败
+ * ========================================================================== */
+(function () {
+  const HEX = 'abcdef0123456789abcdef0123456789';
+  const enc = (i) => HEX.slice(0, 30) + String(i).padStart(2, '0');
+
+  /* ---------- 课程列表：频道接口 ---------- */
+  const CHANNEL_JSON = {
+    channelList: [
+      { content: { id: '9001', cpi: '1001', isretire: 0, course: { data: [{ id: 'c1', name: '高等数学 A' }] } } },
+      // 一个频道挂两门课 —— 旧版只取 data[0]，会漏掉「编译原理」
+      {
+        content: {
+          id: '9002', cpi: '1002', isretire: 0,
+          course: { data: [{ id: 'c2', name: '数据结构' }, { id: 'c3', name: '编译原理' }] },
+        },
+      },
+      // 重复项
+      { content: { id: '9001', cpi: '1001', isretire: 0, course: { data: [{ id: 'c1', name: '高等数学 A' }] } } },
+      // 已结课
+      { content: { id: '9004', cpi: '1004', isretire: 1, course: { data: [{ id: 'c4', name: '已结课的老课' }] } } },
+    ],
+  };
+
+  /* ---------- 课程列表：课程页 HTML（补一门频道里没有的课） ---------- */
+  const COURSELIST_HTML =
+    '<div class="course-list">' +
+    '<a href="/visit/stucoursemiddle?courseid=c5&clazzid=9005&cpi=1005&vc=1">大学物理（下）</a>' +
+    '<a href="/visit/stucoursemiddle?courseid=c1&clazzid=9001&cpi=1001&vc=1">高等数学 A</a>' +
+    '</div>';
+
+  const STU_HTML = (i) =>
+    '<html><body><input id="workEnc" value="' + enc(i) + '">' +
+    '<a href="?stuenc=' + enc(i + 50) + '">x</a></body></html>';
+
+  /* ---------- 作业列表 HTML ---------- */
+  function workHtml(list, pages) {
+    let h = '<ul class="work-list">';
+    for (const it of list) {
+      h +=
+        '<li data="https://mooc1.chaoxing.com/mooc-ans/mooc2/work/view?courseId=x&workId=' +
+        it.id + '&enc=zz">' +
+        '<p class="overHidden2">' + it.title + '</p>' +
+        '<p class="status">' + it.status + '</p>' +
+        (it.time ? '<p class="time notOver">' + it.time + '</p>' : '') +
+        '</li>';
+    }
+    h += '</ul>';
+    if (pages > 1) {
+      h += '<div id="page"><ul>';
+      for (let p = 1; p <= pages; p++) h += '<li>' + p + '</li>';
+      h += '<li class="next"><a href="?pageNum=2">下一页</a></li></ul></div>';
+    }
+    return h;
+  }
+
+  const T1 = '第二章 极限与连续 习题';
+  const T2 = '单元测验：线性表';
+  const T3 = '第三章 树与二叉树';
+  const T4 = '词法分析实验';
+
+  /* ---------- GM_xmlhttpRequest 假实现 ---------- */
+  window.GM_getValue = function (k, d) { return d; };
+  window.GM_setValue = function () {};
+  window.GM_addStyle = function () {};
+  window.GM_xmlhttpRequest = function (o) {
+    const url = o.url;
+    let body = '';
+    let status = 200;
+
+    const reply = (t) => setTimeout(() => o.onload({ status: 200, responseText: t, finalUrl: url }), 1);
+
+    if (url.indexOf('backclazzdata') >= 0) {
+      return reply(JSON.stringify(CHANNEL_JSON));
+    }
+    if (url.indexOf('courselistdata') >= 0) {
+      return reply(COURSELIST_HTML);
+    }
+    if (url.indexOf('stucoursemiddle') >= 0) {
+      const id = (/courseid=([^&]+)/.exec(url) || [])[1] || '0';
+      if (id === 'c4') {
+        // 这门课取不到 workEnc，用来验证「单课失败不影响其他课」
+        status = 200;
+        return reply('<html><body>没有 enc</body></html>');
+      }
+      return reply(STU_HTML(1));
+    }
+    if (url.indexOf('work/list') >= 0) {
+      const courseId = (/courseId=([^&]+)/.exec(url) || [])[1];
+      const page = parseInt((/pageNum=(\d+)/.exec(url) || [])[1] || '1', 10);
+      const isMooc2 = url.indexOf('mooc2-ans.chaoxing.com') >= 0;
+
+      if (courseId === 'c1') {
+        if (page === 1) {
+          return reply(
+            workHtml(
+              [
+                { id: '101', title: T1, status: '未交', time: '剩余 5 小时 30 分钟' },
+                // 已交但状态仍是未交且没有 .time —— 视为已过期
+                { id: '102', title: '第一章 预习作业', status: '未交', time: '' },
+              ],
+              1
+            )
+          );
+        }
+        return reply(workHtml([], 1));
+      }
+      if (courseId === 'c2') {
+        if (page === 1) {
+          return reply(
+            workHtml(
+              [
+                { id: '201', title: T2, status: '未交', time: '剩余 2 天 3 小时' },
+                { id: '202', title: '实验一：顺序表', status: '待批阅', time: '剩余 1 天' },
+              ],
+              2
+            )
+          );
+        }
+        return reply(workHtml([{ id: '203', title: T3, status: '未交', time: '剩余 90 小时 37 分钟' }], 2));
+      }
+      if (courseId === 'c3') {
+        // 只在 mooc2-ans 上能取到 —— 验证「换站重试」
+        return reply(isMooc2 ? workHtml([{ id: '301', title: T4, status: '未交', time: '剩余 4 天' }], 1) : workHtml([], 1));
+      }
+      if (courseId === 'c5') {
+        // 返回空列表，但能正常解析 —— 验证「0 条」在诊断里可见
+        return reply(workHtml([], 1));
+      }
+      return reply(workHtml([], 1));
+    }
+
+    setTimeout(() => {
+      if (status === 200) o.onload({ status: 200, responseText: body || '<html></html>', finalUrl: url });
+      else o.onerror({});
+    }, 1);
+  };
+})();
+</script>
+
+<script src="../chaoxing-deadline.user.js"></script>
+<script>
+(async function () {
+  const out = document.getElementById('out');
+  const res = {};
+  try {
+    const S = {
+      reminders: [-120], withExams: false, withNotices: false,
+      includePeerReview: true, includeGrading: true,
+      includeExpired: false, hideRetired: false, preciseMode: false,
+    };
+    const r1 = await window.__CXD__.scanAll(S, null);
+    res.totalCourses = r1.totalCourses;
+    res.scanned = r1.courseCount;
+    res.items = r1.items.length;
+    res.diag = r1.diag.map(function (d) {
+      return d.name + '=' + (d.ok ? d.count : 'FAIL');
+    });
+    res.c3host = (r1.diag.find(function (d) { return d.name === '编译原理'; }) || {}).host || '';
+    res.titles = r1.items.map(function (i) { return i.courseName + '|' + i.title; }).sort();
+
+    const r2 = await window.__CXD__.scanAll(Object.assign({}, S, { includeExpired: true }), null);
+    res.itemsWithExpired = r2.items.length;
+    res.expiredTitles = r2.items.filter(function (i) { return i.expired; }).map(function (i) { return i.title; });
+  } catch (e) {
+    res.error = String(e && e.stack ? e.stack : e);
+  }
+  out.textContent = JSON.stringify(res, null, 2);
+})();
+</script>
+</body>
+</html>
