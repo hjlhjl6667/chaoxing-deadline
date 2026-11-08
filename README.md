@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/hjlhjl6667/chaoxing-deadline/actions/workflows/test.yml/badge.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/releases)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/releases)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-✓-orange.svg)](https://github.com/hjlhjl6667/chaoxing-deadline/raw/main/chaoxing-deadline.user.js)
 
 > 把学习通的作业截止时间，变成你手机日历里的**真实闹钟**。
@@ -129,12 +129,26 @@ node tools/gen-calendar-preview.mjs   # 改了 demo.ics 后重新生成
 - **诊断**：右上角列表图标。逐门课列出「抓到几条」，0 条和失败都会显示。**怀疑漏课时先看这里**
 - **复制清单**：把待办导出成 Markdown，适合贴进 Notion / Obsidian / 备忘录
 - **设置**：可开关「包含考试」「包含待互评」「包含待批阅」「包含未读通知」「包含已过期」「跳过已结课」
+- **待批阅保留时长**：默认 30 天。躺了超过这个时间还没批的作业自动从列表隐藏，免得一屏都是老师不会再看的东西；可选 不限制 / 14 天 / 30 天 / 60 天
 - 扫描结果缓存 5 分钟，课程列表缓存 30 分钟，避免反复请求
 - 倒计时每 30 秒自动刷新，不用手动重开面板
 
 ![诊断视图](assets/diag.png)
 
 <sub>诊断视图：每门课抓到多少条一目了然。0 条不一定是错的，但如果你确定那门课有作业，就说明解析没命中。</sub>
+
+### 关于「待批阅」
+
+已提交、老师还没批的作业只能显示成待批阅，**它没有截止时间，你也不会再对它做任何事**。默认超过 30 天就自动隐藏，判据是：
+
+- 有截止时间的 → 按截止时间算已经过去多久
+- 没有截止时间的 → 按**脚本第一次扫到它的时间**算。所以新交的作业会正常出现，躺满 30 天后自动消失
+
+顶部副标题会显示「隐藏 N 项」，把鼠标停上去能看到具体天数。想要全部看到，把设置里的时长改成「不限制」。
+
+排序也一起调了：**还没截止的排在前面**（越近越前），已截止的沉到后面。待批阅和已过期作业不会再把真正的待交作业挤下去。
+
+![待批阅](assets/grading.png)
 
 ---
 
@@ -192,6 +206,7 @@ node tools/gen-calendar-preview.mjs   # 改了 demo.ics 后重新生成
 
 ```bash
 node test/ics.test.mjs      # 67 项逻辑断言（时间解析 / ICS 转义 / UTF-8 折行 / 日历结构）
+node test/grading.test.mjs  # 15 项断言（待批阅过期过滤：截止时间 / 首次扫描时间 / 各档阈值）
 node tools/gen-demo.mjs     # 重新生成 examples/demo.ics
 node tools/gen-calendar-preview.mjs   # 重新生成可视化验证页
 ```
@@ -213,6 +228,13 @@ tools/e2e-scan.html    # 浏览器打开，页面会把扫描结果以 JSON 打�
 ---
 
 ## 更新日志
+
+### v1.2.0
+
+- **新增「待批阅保留时长」**：默认 30 天，躺太久还没批的自动从列表隐藏。有截止时间按截止时间算，没有的按第一次扫到它的时间算，所以新交的作业不会误伤
+- **排序修正**：还没截止的排前面，已截止的沉底。待批阅和已过期作业不再压在待交作业上面
+- 顶部副标题显示「隐藏 N 项」，悬停可看具体天数
+- 新增 `test/grading.test.mjs`，15 项断言覆盖阈值边界与两种时间来源
 
 ### v1.1.0
 

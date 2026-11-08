@@ -62,8 +62,24 @@
       mk({ uid: 'a7', kind: 'notice', courseName: '数据结构 · 李老师',
         title: '关于实验课调至周四下午的通知', status: '未读',
         category: 'notice', deadline: null }),
+      // 待批阅：前两条应保留，后两条应被「30 天」规则隐藏
+      mk({ uid: 'g1', kind: 'homework', courseName: '大学英语（三）',
+        title: 'Unit 4 Summary Writing', status: '待批阅',
+        category: 'grading', deadline: now - 4 * D }),
+      mk({ uid: 'g4', kind: 'homework', courseName: '线性代数',
+        title: '第二次平时作业', status: '待批阅',
+        category: 'grading', deadline: null }),
+      mk({ uid: 'g2', kind: 'homework', courseName: '高等数学 A（上）',
+        title: '第二章 极限与连续 课后习题', status: '待批阅',
+        category: 'grading', deadline: now - 46 * D }),
+      mk({ uid: 'g3', kind: 'homework', courseName: '马克思主义基本原理',
+        title: '第一章 思考题', status: '待批阅',
+        category: 'grading', deadline: null }),
     ],
   };
+
+  // g3 没有截止时间，靠「首次扫到的时间」判断：68 天前就已经躺在那儿了
+  store['cxd_seen_v1'] = { g1: now - 4 * D, g2: now - 46 * D, g3: now - 68 * D, g4: now - 3 * D };
 
   window.GM_addStyle = function (css) {
     const s = document.createElement('style');
@@ -96,6 +112,12 @@
     if (location.search.indexOf('diag') >= 0) {
       var btn = root.querySelector('#cxd-diag-btn');
       if (btn) btn.click();
+    }
+    if (location.search.indexOf('grading') >= 0) {
+      var tabs = root.querySelectorAll('.cxd-tab');
+      for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].textContent.indexOf('待批阅') === 0) { tabs[i].click(); break; }
+      }
     }
     if (location.search.indexOf('settings') >= 0) {
       var sb = root.querySelector('#cxd-set-btn');

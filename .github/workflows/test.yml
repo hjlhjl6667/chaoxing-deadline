@@ -23,6 +23,9 @@ jobs:
       - name: 断言测试
         run: node test/ics.test.mjs
 
+      - name: 待批阅过滤测试
+        run: node test/grading.test.mjs
+
       - name: 生成示例日历
         run: node tools/gen-demo.mjs
 

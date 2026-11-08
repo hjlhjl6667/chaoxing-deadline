@@ -2,7 +2,7 @@
 // @name         学习通作业倒计时 · 日历订阅
 // @name:en      Chaoxing Deadline → Calendar
 // @namespace    https://github.com/hjlhjl6667/chaoxing-deadline
-// @version      1.1.0
+// @version      1.2.0
 // @description  一键扫描学习通全部课程的未交作业、待互评、待批阅、考试与未读通知，按剩余时间排序，并可导出 .ics 导入手机系统日历，到期自动提醒。不是又一个网页面板 —— 是让截止时间真正进入你的日程。
 // @description:en Scan all Chaoxing assignments/exams/notices in one click, sort by time left, and export to .ics so deadlines live in your phone's calendar with real alarms.
 // @author       hjlhjl6667
@@ -54,7 +54,11 @@
     scan: 'cxd_scan_v1',
     courses: 'cxd_courses_v1',
     settings: 'cxd_settings_v1',
+    seen: 'cxd_seen_v1',
+    boot: 'cxd_boot_v1',      // 是否已经记录过一轮「首次见到」时间
   };
+
+  const DAY_MS = 864e5;
 
   const DEFAULTS = {
     reminders: [-3 * 24 * 60, -24 * 60, -120],
@@ -65,6 +69,7 @@
     includeExpired: false,
     hideRetired: false,     // 默认扫描全部课程（含已结课），不漏课
     preciseMode: false,      // 走作业详情页取绝对时间（请求量大）
+    gradingMaxAgeDays: 30,   // 待批阅超过这么多天就隐藏，0 = 不限制
   };
 
   /* ==========================================================================
@@ -894,11 +899,33 @@
       }
     }
 
+    // 待批阅作业多半没有截止时间可用，只能靠「第一次扫到它的时间」推算它躺了多久。
+    // 每次扫描都用当前结果重建这张表，旧条目自然被淘汰，不会无限增长。
+    const seenOld = loadSeen();
+    const seenNow = Date.now();
+    const booted = !!GM_getValue(STORE.boot, 0);
+    const seen = {};
+    items.forEach((it) => {
+      if (it.kind === 'homework' && it.category === 'grading') {
+        // 升级后第一次扫描时，这些作业早就躺在那儿了，没有历史可查，
+        // 按「已过期 31 天」起算，让它们立刻隐藏，而不是再等一个月。
+        seen[it.uid] = seenOld[it.uid] || (booted ? seenNow : seenNow - 31 * DAY_MS);
+      }
+    });
+    GM_setValue(STORE.seen, seen);
+    if (!booted) GM_setValue(STORE.boot, seenNow);
+
     items = filterItems(items, settings);
 
-    // 排序：有截止时间的按时间升序，无时间的排最后
+    // 排序分两档：还没截止的排前面（近的在前），已截止的排后面（近的在前）。
+    // 待批阅 / 已过期作业的截止时间都在过去，不该挤在真正要交的作业上面。
+    const sortNow = Date.now();
+    const isFuture = (it) => (it.deadline && it.deadline > sortNow ? 0 : 1);
     items.sort((a, b) => {
-      if (a.deadline && b.deadline) return a.deadline - b.deadline;
+      const tier = isFuture(a) - isFuture(b);
+      if (tier) return tier;
+      if (isFuture(a) === 0) return a.deadline - b.deadline;      // 未截止：越近越前
+      if (a.deadline && b.deadline) return b.deadline - a.deadline; // 已截止：越近越前
       if (a.deadline) return -1;
       if (b.deadline) return 1;
       return String(a.title).localeCompare(String(b.title), 'zh');
@@ -1168,6 +1195,36 @@
     timer: null,
   };
 
+  function loadSeen() {
+    const v = GM_getValue(STORE.seen, null);
+    return v && typeof v === 'object' ? v : {};
+  }
+
+  /* @testable:start grading */
+  /** 这条待批阅作业已经「躺着」多少天：优先用截止时间，其次用首次扫到它的时间 */
+  function gradingAgeDays(it, seen, now) {
+    if (it.deadline) return Math.max(0, (now - it.deadline) / DAY_MS);
+    const first = seen[it.uid];
+    if (first) return Math.max(0, (now - first) / DAY_MS);
+    return 0;
+  }
+
+  /** 过滤超过 limit 天仍未批阅的作业。limit 为 0 表示不限制 */
+  function pickVisible(items, limit, seen, now) {
+    const days = Number(limit) || 0;
+    if (!days) return items;
+    return items.filter((it) => {
+      if (it.kind !== 'homework' || it.category !== 'grading') return true;
+      return gradingAgeDays(it, seen, now) <= days;
+    });
+  }
+  /* @testable:end grading */
+
+  /** 列表、标签计数、顶部统计统一走这里，设置一改立刻生效，不用重新扫 */
+  function visibleItems() {
+    return pickVisible(state.items, loadSettings().gradingMaxAgeDays, loadSeen(), Date.now());
+  }
+
   function loadSettings() {
     const s = GM_getValue(STORE.settings, null);
     return Object.assign({}, DEFAULTS, s || {});
@@ -1302,7 +1359,8 @@
 
   function renderStats() {
     const now = Date.now();
-    const pend = state.items.filter((i) => !i.expired);
+    const vis = visibleItems();
+    const pend = vis.filter((i) => !i.expired);
     const urgent = pend.filter((i) => i.deadline && i.deadline - now <= CFG.URGENT && i.deadline > now);
     const week = pend.filter((i) => i.deadline && i.deadline - now <= CFG.SOON && i.deadline > now);
     $('#cxd-s-urgent').textContent = urgent.length;
@@ -1324,9 +1382,14 @@
         : '正在获取课程列表…';
     } else if (state.scannedAt) {
       const t = new Date(state.scannedAt);
+      const hidden = state.items.length - vis.length;
       sub.textContent =
         `${pad2(t.getHours())}:${pad2(t.getMinutes())} 扫描 · ` +
-        `${state.courseCount} 门课 · ${state.items.length} 项`;
+        `${state.courseCount} 门课 · ${vis.length} 项` +
+        (hidden ? ` · 隐藏 ${hidden} 项` : '');
+      sub.title = hidden
+        ? `另有 ${hidden} 项待批阅超过 ${loadSettings().gradingMaxAgeDays} 天，已隐藏（设置里可调）`
+        : '';
     } else sub.textContent = '点击「刷新」开始扫描';
   }
 
@@ -1353,8 +1416,9 @@
   function renderTabs() {
     const box = $('#cxd-tabs');
     box.innerHTML = '';
+    const vis = visibleItems();
     for (const t of TABS) {
-      const n = state.items.filter((i) => matchTab(i, t.k)).length;
+      const n = vis.filter((i) => matchTab(i, t.k)).length;
       if (!n && t.k !== 'all') continue;
       const b = document.createElement('button');
       b.className = 'cxd-tab' + (state.filter === t.k ? ' on' : '');
@@ -1422,14 +1486,15 @@
       </div>`;
       return;
     }
-    if (!state.items.length) {
+    const vis = visibleItems();
+    if (!vis.length) {
       box.innerHTML = `<div class="cxd-empty">${
         state.scannedAt ? '没有符合条件的待办 🎉' : '还没有扫描过<br>点击下方「刷新」开始'
       }</div>`;
       return;
     }
 
-    const shown = state.items.filter((i) => matchTab(i, state.filter));
+    const shown = vis.filter((i) => matchTab(i, state.filter));
     box.innerHTML = '';
 
     if (state.warnings.length) {
@@ -1530,6 +1595,22 @@
         ${switchRow('withExams', '包含考试', '考试列表也一并导出', s.withExams)}
         ${switchRow('includePeerReview', '包含待互评', '别人作业等你评的，也有截止时间', s.includePeerReview)}
         ${switchRow('includeGrading', '包含待批阅', '已提交但老师还没批的', s.includeGrading)}
+        <div class="cxd-row" style="border-bottom:0;padding-bottom:0">
+          <div><label>待批阅保留时长</label><span class="hint">躺了这么久还没批的，自动从列表隐藏</span></div>
+        </div>
+        <div class="cxd-rem" id="cxd-grade-age">
+          ${[
+            [0, '不限制'],
+            [14, '14 天'],
+            [30, '30 天'],
+            [60, '60 天'],
+          ]
+            .map(
+              ([v, t]) =>
+                `<button data-v="${v}" class="${Number(s.gradingMaxAgeDays) === v ? 'on' : ''}">${t}</button>`
+            )
+            .join('')}
+        </div>
         ${switchRow('withNotices', '包含未读通知', '实验性：接口可能随平台调整而失效', s.withNotices)}
         ${switchRow('includeExpired', '包含已过期', '默认隐藏，避免干扰', s.includeExpired)}
         ${switchRow('hideRetired', '跳过已结课', '默认关闭：结课课程里也可能有没交的作业', s.hideRetired)}
@@ -1546,6 +1627,18 @@
         cur.reminders.sort((a, b2) => b2 - a);
         saveSettings(cur);
         b.classList.toggle('on');
+      });
+    });
+
+    box.querySelectorAll('#cxd-grade-age button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const cur = loadSettings();
+        cur.gradingMaxAgeDays = parseInt(b.dataset.v, 10) || 0;
+        saveSettings(cur);
+        box
+          .querySelectorAll('#cxd-grade-age button')
+          .forEach((x) => x.classList.toggle('on', x === b));
+        renderStats();
       });
     });
 
